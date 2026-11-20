@@ -4,8 +4,15 @@ import Foundation
 ///
 /// Addressing (strictly disjoint so FakeIP NEVER collides with TUN or DNS!):
 /// - TUN IPv4: 172.19.0.1/30 (DNS: 172.19.0.2)
-/// - TUN IPv6: fdfe:dcba:9876::1/126
-/// - FakeIP pool: 198.18.0.0/15 & fc00::/18
+/// - TUN IPv6: fdfe:dcba:9876::1/126 (captured only so it can be rejected — IPv6 is disabled)
+/// - FakeIP pool: 198.18.0.0/15 (IPv4 only)
+///
+/// IPv6 is disabled end to end so the exit IP never flips between a dual-stack node's
+/// IPv4 and IPv6 addresses (which used to trip the pinned-IP kill switch):
+/// - AAAA queries get an empty answer, so apps only ever see IPv4.
+/// - Any IPv6 packet entering the TUN is rejected (never leaks around the tunnel).
+/// - Proxied traffic is resolved to IPv4 *before* being handed to the node, so the remote
+///   server dials an IPv4 literal instead of picking IPv4 or IPv6 on its own.
 enum TunnelSingBoxConfigGenerator {
 
     static let openAIDomainSuffixes: [String] = [
@@ -60,7 +67,7 @@ enum TunnelSingBoxConfigGenerator {
         var proxyOutbound = try decodeOutbound(node)
         proxyOutbound["tag"] = "proxy"
         if proxyOutbound["domain_resolver"] == nil {
-            proxyOutbound["domain_resolver"] = "dns_bootstrap"
+            proxyOutbound["domain_resolver"] = ["server": "dns_bootstrap", "strategy": "ipv4_only"]
         }
 
         let root: [String: Any] = [
@@ -79,6 +86,8 @@ enum TunnelSingBoxConfigGenerator {
             "outbounds": [proxyOutbound],
             "route": [
                 "rules": [
+                    // Resolve to IPv4 through the node so its exit is always the IPv4 address.
+                    ["inbound": ["mixed-in"], "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"],
                     ["inbound": ["mixed-in"], "outbound": "proxy"]
                 ],
                 "final": "proxy",
@@ -99,7 +108,7 @@ enum TunnelSingBoxConfigGenerator {
         var proxyOutbound = try decodeOutbound(node)
         proxyOutbound["tag"] = proxyTag
         if proxyOutbound["domain_resolver"] == nil {
-            proxyOutbound["domain_resolver"] = "dns_local"
+            proxyOutbound["domain_resolver"] = ["server": "dns_local", "strategy": "ipv4_only"]
         }
 
         let targetDomains = settings.includeAuthHelperDomains
@@ -117,6 +126,15 @@ enum TunnelSingBoxConfigGenerator {
                 "detour": "guard"
             ],
             [
+                // Exit-IP probe resolver: goes straight through the bound node, so it works while guard is sealed.
+                "tag": "dns_probe",
+                "type": "https",
+                "server": "1.1.1.1",
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": proxyTag
+            ],
+            [
                 "tag": "dns_local",
                 "type": "udp",
                 "server": "223.5.5.5",
@@ -125,20 +143,22 @@ enum TunnelSingBoxConfigGenerator {
             [
                 "tag": "dns_fakeip",
                 "type": "fakeip",
-                "inet4_range": "198.18.0.0/15",
-                "inet6_range": "fc00::/18"
+                "inet4_range": "198.18.0.0/15"
             ]
         ]
 
-        var dnsRules: [[String: Any]] = []
+        // IPv6 disabled: every AAAA query gets an empty NOERROR answer so clients fall back to IPv4 instantly.
+        var dnsRules: [[String: Any]] = [
+            ["query_type": ["AAAA"], "action": "predefined", "rcode": "NOERROR"]
+        ]
         if settings.globalMode {
-            // Global mode: A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy
-            dnsRules.append(["query_type": ["A", "AAAA"], "server": "dns_fakeip"])
+            // Global mode: A -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy
+            dnsRules.append(["query_type": ["A"], "server": "dns_fakeip"])
         } else {
-            // Split mode: OpenAI/ChatGPT A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy; Chinese apps -> fast local DNS
+            // Split mode: OpenAI/ChatGPT A -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy; Chinese apps -> fast local DNS
             dnsRules.append([
                 "domain_suffix": targetDomains,
-                "query_type": ["A", "AAAA"],
+                "query_type": ["A"],
                 "server": "dns_fakeip"
             ])
             dnsRules.append([
@@ -150,7 +170,11 @@ enum TunnelSingBoxConfigGenerator {
         var routeRules: [[String: Any]] = [
             ["action": "sniff"],
             ["protocol": "dns", "action": "hijack-dns"],
-            // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog
+            // IPv6 disabled: reject every IPv6 packet entering the TUN (captured so it can't bypass the tunnel).
+            ["inbound": ["tun-in"], "ip_version": 6, "action": "reject"],
+            // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog.
+            // Resolve to IPv4 first so the watchdog sees the same IPv4 exit that ChatGPT traffic uses.
+            ["inbound": ["mixed-in"], "action": "resolve", "server": "dns_probe", "strategy": "ipv4_only"],
             ["inbound": ["mixed-in"], "outbound": proxyTag]
         ]
 
@@ -158,11 +182,14 @@ enum TunnelSingBoxConfigGenerator {
         if settings.globalMode {
             // Reject UDP 443 QUIC globally so TLS falls back cleanly to TCP
             routeRules.append(["network": "udp", "port": [443], "action": "reject"])
+            // Hand the node an IPv4 literal so a dual-stack node can never egress over IPv6.
+            routeRules.append(["action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
             routeFinal = "guard"
         } else {
             routeRules.append(["network": "udp", "port": [443], "domain_suffix": targetDomains, "action": "reject"])
+            routeRules.append(["domain_suffix": targetDomains, "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
             routeRules.append(["domain_suffix": targetDomains, "outbound": "guard"])
-            routeRules.append(["ip_cidr": ["198.18.0.0/15", "fc00::/18"], "outbound": "guard"])
+            routeRules.append(["ip_cidr": ["198.18.0.0/15"], "outbound": "guard"])
             routeFinal = "direct"
         }
 

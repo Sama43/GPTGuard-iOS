@@ -24,15 +24,41 @@ struct TunnelConfigTests {
             let dnsServers = dns["servers"] as! [[String: Any]]
             let dnsRemote = dnsServers.first { $0["tag"] as? String == "dns_remote" }!
             precondition(dnsRemote["detour"] as? String == "guard")
+            let dnsProbe = dnsServers.first { $0["tag"] as? String == "dns_probe" }!
+            precondition(dnsProbe["detour"] as? String == tag)
+            // IPv6 disabled: no IPv6 FakeIP pool, AAAA answered empty before any other DNS rule.
+            let fakeip = dnsServers.first { $0["tag"] as? String == "dns_fakeip" }!
+            precondition(fakeip["inet6_range"] == nil)
+            let dnsRules = dns["rules"] as! [[String: Any]]
+            precondition(dnsRules.first?["query_type"] as? [String] == ["AAAA"]
+                && dnsRules.first?["action"] as? String == "predefined")
+            precondition(!dnsRules.dropFirst().contains { ($0["query_type"] as? [String])?.contains("AAAA") == true })
             let route = root["route"] as! [String: Any]
             precondition(route["final"] as? String == (global ? "guard" : "direct"))
             let rules = route["rules"] as! [[String: Any]]
-            precondition(rules.contains { $0["inbound"] as? [String] == ["mixed-in"] && $0["outbound"] as? String == tag })
+            let probeRoute = rules.firstIndex { $0["inbound"] as? [String] == ["mixed-in"] && $0["outbound"] as? String == tag }!
+            let probeResolve = rules.firstIndex { $0["inbound"] as? [String] == ["mixed-in"] && $0["action"] as? String == "resolve" }!
+            precondition(probeResolve < probeRoute && rules[probeResolve]["server"] as? String == "dns_probe"
+                && rules[probeResolve]["strategy"] as? String == "ipv4_only")
+            let rejectV6 = rules.firstIndex { $0["ip_version"] as? Int == 6 && $0["action"] as? String == "reject" }!
+            precondition(rejectV6 < probeResolve)
+            let guardResolve = rules.firstIndex { $0["action"] as? String == "resolve" && $0["server"] as? String == "dns_remote" }!
+            precondition(rules[guardResolve]["strategy"] as? String == "ipv4_only")
+            let outbound = outbounds.first { $0["tag"] as? String == tag }!
+            precondition((outbound["domain_resolver"] as? [String: Any])?["strategy"] as? String == "ipv4_only")
             if !global {
-                precondition(rules.contains { $0["domain_suffix"] != nil && $0["outbound"] as? String == "guard" })
-                precondition(rules.contains { $0["ip_cidr"] != nil && $0["outbound"] as? String == "guard" })
+                let guardRoute = rules.firstIndex { $0["domain_suffix"] != nil && $0["outbound"] as? String == "guard" }!
+                precondition(guardResolve < guardRoute && rules[guardResolve]["domain_suffix"] != nil)
+                precondition(rules.contains { $0["ip_cidr"] as? [String] == ["198.18.0.0/15"] && $0["outbound"] as? String == "guard" })
             }
             try config.write(to: directory.appendingPathComponent("tunnel-\(global).json"), atomically: true, encoding: .utf8)
         }
+
+        // Speed-test probe must also force the node to egress over IPv4.
+        let probe = try TunnelSingBoxConfigGenerator.generateStandaloneProbe(node: node, corePort: 30001)
+        let probeRoot = try JSONSerialization.jsonObject(with: Data(probe.utf8)) as! [String: Any]
+        let probeRules = (probeRoot["route"] as! [String: Any])["rules"] as! [[String: Any]]
+        precondition(probeRules.first?["action"] as? String == "resolve"
+            && probeRules.first?["strategy"] as? String == "ipv4_only")
     }
 }

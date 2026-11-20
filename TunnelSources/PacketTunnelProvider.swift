@@ -471,6 +471,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0")]
         net.ipv4Settings = ipv4
 
+        // IPv6 is disabled, but it must still be captured: without this default route, IPv6 traffic would
+        // bypass the tunnel. sing-box rejects every IPv6 packet and answers AAAA queries empty.
         let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::1"], networkPrefixLengths: [126])
         ipv6.includedRoutes = [NEIPv6Route.default()]
         net.ipv6Settings = ipv6
