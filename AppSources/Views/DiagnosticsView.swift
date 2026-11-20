@@ -8,6 +8,7 @@ struct DiagnosticsView: View {
     @State private var confirmClear = false
     @State private var copiedPrompt = false
     @State private var webDataCleared = false
+    @AppStorage(IPPurityChecker.ipapiKeyDefaultsKey) private var ipapiKey = ""
 
     private static let selfTestPrompt = "请用表格列出你当前可用的全部工具（例如联网搜索、画图、代码解释器、文件分析、记忆等），以及你当前的模型名称。"
 
@@ -20,6 +21,7 @@ struct DiagnosticsView: View {
                     timezoneCard
                     powCard
                     selfTestCard
+                    sourcesCard
                 }
                 .padding()
             }
@@ -94,14 +96,19 @@ struct DiagnosticsView: View {
                 kv("地区", [report.countryCode, report.country, report.city].compactMap { $0 }.joined(separator: " · "))
                 kv("运营商 / 机构", [report.org, report.companyType].compactMap { $0 }.joined(separator: " · "))
                 kv("Cloudflare 节点", [report.trace.colo, report.trace.warp.map { "WARP \($0)" }].compactMap { $0 }.joined(separator: " · "))
-                if let abuser = report.abuserScore { kv("滥用评分", abuser) }
-                if let direct = engine.snapshot.directIp, engine.vpnStatus == .connected {
-                    kv("本机直连 IP", direct)
+                Group {
+                    if report.connectionType != nil || report.riskScore != nil {
+                        kv("网络类型 / 风险分", [report.connectionType, report.riskScore.map { "风险 \($0)/100" }].compactMap { $0 }.joined(separator: " · "))
+                    }
+                    if let abuser = report.abuserScore { kv("滥用评分", abuser) }
+                    if let direct = engine.snapshot.directIp, engine.vpnStatus == .connected {
+                        kv("本机直连 IP", direct)
+                    }
                 }
                 if report.hasReputation {
                     flagRow(report)
                 } else {
-                    Text("信誉库（ipapi.is）暂不可用，仅显示地理信息，分数只计算了地区。")
+                    Text("IP 信誉库（proxycheck.io / ip-api.com）都没有响应，仅显示地理信息，分数只计算了地区。可能是查询太频繁，稍后再试。")
                         .font(.caption2).foregroundStyle(VpnTheme.warnAmber)
                 }
                 if report.risks.isEmpty {
@@ -118,7 +125,7 @@ struct DiagnosticsView: View {
                         }
                     }
                 }
-                Text("检测于 \(report.checkedAt.formatted(date: .omitted, time: .standard)) · 评分为社区经验规则，仅供参考")
+                Text("检测于 \(report.checkedAt.formatted(date: .omitted, time: .standard)) · 数据源：\(report.sources.isEmpty ? "无" : report.sources.joined(separator: " / ")) · 评分为社区经验规则，仅供参考")
                     .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
             } else if let error = diagnostics.lastError {
                 Text(error).font(.caption).foregroundStyle(VpnTheme.killRed)
@@ -141,6 +148,13 @@ struct DiagnosticsView: View {
                 }
                 kv("本机时区", "\(tz.deviceId) · \(TimezoneCheck.formatOffset(tz.deviceOffsetSec))")
                 kv("IP 所在时区", tz.ipId.map { id in "\(id) · \(tz.ipOffsetSec.map(TimezoneCheck.formatOffset) ?? "?")" } ?? "未知")
+                if let source = diagnostics.report?.timezoneSource {
+                    kv("时区来源", source)
+                }
+                if let conflict = diagnostics.report?.timezoneConflict {
+                    Text("注意：各 IP 库对该 IP 的定位不一致（\(conflict)），ChatGPT 实际采用的地理库未知。")
+                        .font(.caption2).foregroundStyle(VpnTheme.warnAmber)
+                }
                 if tz.status == .mismatch {
                     Text("IP 所在地与本机时区不一致，部分服务会把这种不一致当作风险信号。可选择与本机时区相同地区的节点，或在「设置 › 通用 › 日期与时间」中核对时区。")
                         .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
@@ -218,6 +232,22 @@ struct DiagnosticsView: View {
                 UIPasteboard.general.string = Self.selfTestPrompt
                 copiedPrompt = true
             }
+        }
+    }
+
+    private var sourcesCard: some View {
+        card(title: "检测数据源", icon: "server.rack") {
+            Text("IP 出口：chatgpt.com/cdn-cgi/trace（即 ChatGPT 实际看到的 IP）。信誉与时区：proxycheck.io、ip-api.com、ipapi.is 三方合并，任一标记即计入。")
+                .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
+            Text("ipapi.is 免 Key 版自 2026-09 起不再返回机房 / VPN / 代理标记，且每天仅 30 次。在 ipapi.is 免费注册后填入 API Key，可恢复完整标记（每天 1000 次）。")
+                .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
+            SecureField("ipapi.is API Key（可选）", text: $ipapiKey)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.caption)
+                .padding(8)
+                .background(VpnTheme.cardDark)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
 

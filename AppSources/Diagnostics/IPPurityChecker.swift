@@ -24,6 +24,10 @@ struct IPPurityReport: Codable, Equatable {
     var country: String?
     var city: String?
     var timezoneId: String?
+    /// Which lookup supplied `timezoneId`.
+    var timezoneSource: String?
+    /// Other sources reported a timezone with a different UTC offset (geo databases disagree).
+    var timezoneConflict: String?
     var org: String?
     var companyType: String?
     var abuserScore: String?
@@ -33,7 +37,13 @@ struct IPPurityReport: Codable, Equatable {
     var isTor = false
     var isAbuser = false
     var isMobile = false
-    /// false when only the fallback geo source answered (no datacenter / VPN reputation data).
+    /// proxycheck.io connection type (Residential / Wireless / Business / Hosting / VPN / TOR ...).
+    var connectionType: String?
+    /// proxycheck.io risk score 0-100.
+    var riskScore: Int?
+    /// Lookup services that answered.
+    var sources: [String] = []
+    /// false when no source with datacenter / VPN / proxy flags answered.
     var hasReputation = false
     var risks: [PurityRiskItem] = []
     var score = 100
@@ -107,6 +117,9 @@ enum IPPurityChecker {
     /// Common regions where OpenAI does not offer service (incomplete; used as a hint only).
     static let unsupportedRegions: Set<String> = ["CN", "HK", "MO", "RU", "BY", "IR", "KP", "SY", "CU"]
 
+    /// Optional ipapi.is API key (free sign-up). Without it ipapi.is only returns geo + company (no flags).
+    static let ipapiKeyDefaultsKey = "gptguard_ipapi_key"
+
     private static func makeSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
@@ -122,11 +135,31 @@ enum IPPurityChecker {
 
         let trace = try await fetchTrace(session: session)
         var report = IPPurityReport(trace: trace, countryCode: trace.loc)
+        let key = (UserDefaults.standard.string(forKey: ipapiKeyDefaultsKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let info = try? await lookupIpapi(ip: trace.ip, session: session) {
-            apply(ipapi: info, to: &report)
-        } else if let info = try? await lookupIpwho(ip: trace.ip, session: session) {
-            apply(ipwho: info, to: &report)
+        // Query the three sources concurrently; each one is optional.
+        async let ipapiResult = try? lookupIpapi(ip: trace.ip, key: key, session: session)
+        async let proxycheckResult = try? lookupProxycheck(ip: trace.ip, session: session)
+        async let ipApiComResult = try? lookupIpApiCom(ip: trace.ip, session: session)
+        let ipapi = await ipapiResult?.object
+        let proxycheck = await proxycheckResult?.object
+        let ipApiCom = await ipApiComResult?.object
+
+        var zones: [(id: String, source: String)] = []
+        if let obj = ipapi, let tz = apply(ipapi: obj, to: &report) { zones.append((tz, "ipapi.is")) }
+        if let obj = proxycheck, let tz = apply(proxycheck: obj, to: &report) { zones.append((tz, "proxycheck.io")) }
+        if let obj = ipApiCom, let tz = apply(ipApiCom: obj, to: &report) { zones.append((tz, "ip-api.com")) }
+
+        if let first = zones.first {
+            report.timezoneId = first.id
+            report.timezoneSource = first.source
+            let now = Date()
+            let offset = TimeZone(identifier: first.id)?.secondsFromGMT(for: now)
+            let others = zones.dropFirst().filter { TimeZone(identifier: $0.id)?.secondsFromGMT(for: now) != offset }
+            if !others.isEmpty {
+                report.timezoneConflict = others.map { "\($0.source): \($0.id)" }.joined(separator: "，")
+            }
         }
         score(&report)
         return report
@@ -164,9 +197,16 @@ enum IPPurityChecker {
 
     // MARK: - Reputation lookups
 
+    /// JSONSerialization output is immutable once parsed; boxed so it can cross `async let` boundaries.
+    private struct JSONBox: @unchecked Sendable {
+        let object: [String: Any]
+    }
+
     private static func fetchJSON(_ urlString: String, session: URLSession) async throws -> [String: Any] {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
-        let (data, response) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw URLError(.badServerResponse)
@@ -174,60 +214,118 @@ enum IPPurityChecker {
         return obj
     }
 
-    private static func encoded(_ ip: String) -> String {
-        ip.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ip
+    private static func encoded(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
     }
 
-    private static func lookupIpapi(ip: String, session: URLSession) async throws -> [String: Any] {
-        let obj = try await fetchJSON("https://api.ipapi.is/?q=\(encoded(ip))", session: session)
-        guard obj["error"] == nil else { throw URLError(.badServerResponse) }
-        return obj
+    /// ipapi.is: keyless responses are flat (`timezone`, `company`, `country` strings; flags removed 2026-09).
+    /// Keyed responses are nested and include is_datacenter / is_vpn / ... flags.
+    private static func lookupIpapi(ip: String, key: String, session: URLSession) async throws -> JSONBox {
+        var url = "https://api.ipapi.is/?q=\(encoded(ip))"
+        if !key.isEmpty { url += "&key=\(encoded(key))" }
+        let obj = try await fetchJSON(url, session: session)
+        guard obj["error"] == nil, obj["ip"] != nil else { throw URLError(.badServerResponse) }
+        return JSONBox(object: obj)
     }
 
-    private static func lookupIpwho(ip: String, session: URLSession) async throws -> [String: Any] {
-        let obj = try await fetchJSON("https://ipwho.is/\(encoded(ip))", session: session)
-        guard obj["success"] as? Bool != false else { throw URLError(.badServerResponse) }
-        return obj
+    /// proxycheck.io v2 (HTTPS, no key needed for light use).
+    private static func lookupProxycheck(ip: String, session: URLSession) async throws -> JSONBox {
+        let obj = try await fetchJSON("https://proxycheck.io/v2/\(encoded(ip))?vpn=1&asn=1&risk=1", session: session)
+        if (obj["status"] as? String)?.lowercased() == "error" { throw URLError(.badServerResponse) }
+        if let entry = obj[ip] as? [String: Any] { return JSONBox(object: entry) }
+        if let entry = obj.values.compactMap({ $0 as? [String: Any] }).first(where: { $0["proxy"] != nil }) {
+            return JSONBox(object: entry)
+        }
+        throw URLError(.badServerResponse)
+    }
+
+    /// ip-api.com free endpoint (HTTP only on the free tier; ATS exception declared in Info.plist).
+    private static func lookupIpApiCom(ip: String, session: URLSession) async throws -> JSONBox {
+        let fields = "status,message,countryCode,country,city,timezone,isp,org,mobile,proxy,hosting"
+        let obj = try await fetchJSON("http://ip-api.com/json/\(encoded(ip))?fields=\(fields)", session: session)
+        guard obj["status"] as? String == "success" else { throw URLError(.badServerResponse) }
+        return JSONBox(object: obj)
     }
 
     private static func bool(_ obj: [String: Any], _ key: String) -> Bool {
         if let b = obj[key] as? Bool { return b }
         if let n = obj[key] as? NSNumber { return n.boolValue }
+        if let s = obj[key] as? String { return ["yes", "true", "1"].contains(s.lowercased()) }
         return false
     }
 
-    private static func apply(ipapi obj: [String: Any], to report: inout IPPurityReport) {
-        report.hasReputation = true
-        report.isDatacenter = bool(obj, "is_datacenter")
-        report.isVPN = bool(obj, "is_vpn")
-        report.isProxy = bool(obj, "is_proxy")
-        report.isTor = bool(obj, "is_tor")
-        report.isAbuser = bool(obj, "is_abuser")
-        report.isMobile = bool(obj, "is_mobile")
-        if let company = obj["company"] as? [String: Any] {
-            report.org = company["name"] as? String
-            report.companyType = company["type"] as? String
-            report.abuserScore = company["abuser_score"] as? String
-        }
-        if report.org == nil, let asn = obj["asn"] as? [String: Any] {
-            report.org = asn["org"] as? String
-        }
-        if let location = obj["location"] as? [String: Any] {
-            report.countryCode = (location["country_code"] as? String)?.uppercased() ?? report.countryCode
-            report.country = location["country"] as? String
-            report.city = location["city"] as? String
-            report.timezoneId = location["timezone"] as? String
-        }
+    private static func text(_ value: Any?) -> String? {
+        guard let s = value as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return s
     }
 
-    private static func apply(ipwho obj: [String: Any], to report: inout IPPurityReport) {
-        report.countryCode = (obj["country_code"] as? String)?.uppercased() ?? report.countryCode
-        report.country = obj["country"] as? String
-        report.city = obj["city"] as? String
-        if let tz = obj["timezone"] as? [String: Any] { report.timezoneId = tz["id"] as? String }
-        if let connection = obj["connection"] as? [String: Any] {
-            report.org = (connection["isp"] as? String) ?? (connection["org"] as? String)
+    /// Each `apply` merges one source into the report and returns the timezone it reported, if any.
+    private static func apply(ipapi obj: [String: Any], to report: inout IPPurityReport) -> String? {
+        report.sources.append("ipapi.is")
+        var timezone: String?
+        if let location = obj["location"] as? [String: Any] {
+            report.countryCode = text(location["country_code"])?.uppercased() ?? report.countryCode
+            report.country = text(location["country"]) ?? report.country
+            report.city = text(location["city"]) ?? report.city
+            timezone = text(location["timezone"])
+        } else {
+            report.country = text(obj["country"]) ?? report.country
+            report.city = text(obj["city"]) ?? report.city
+            timezone = text(obj["timezone"])
         }
+        if let company = obj["company"] as? [String: Any] {
+            report.org = text(company["name"]) ?? report.org
+            report.companyType = text(company["type"])
+            report.abuserScore = text(company["abuser_score"])
+        } else if let company = text(obj["company"]) {
+            report.org = report.org ?? company
+        }
+        if obj["is_datacenter"] != nil || obj["is_vpn"] != nil {
+            report.hasReputation = true
+            report.isDatacenter = report.isDatacenter || bool(obj, "is_datacenter")
+            report.isVPN = report.isVPN || bool(obj, "is_vpn")
+            report.isProxy = report.isProxy || bool(obj, "is_proxy")
+            report.isTor = report.isTor || bool(obj, "is_tor")
+            report.isAbuser = report.isAbuser || bool(obj, "is_abuser")
+            report.isMobile = report.isMobile || bool(obj, "is_mobile")
+        }
+        return timezone
+    }
+
+    private static func apply(proxycheck obj: [String: Any], to report: inout IPPurityReport) -> String? {
+        report.sources.append("proxycheck.io")
+        report.hasReputation = true
+        report.countryCode = report.countryCode ?? text(obj["isocode"])?.uppercased()
+        report.country = report.country ?? text(obj["country"])
+        report.city = report.city ?? text(obj["city"])
+        report.org = report.org ?? text(obj["organisation"]) ?? text(obj["provider"])
+        let type = text(obj["type"])
+        report.connectionType = type
+        if let risk = obj["risk"] as? NSNumber {
+            report.riskScore = risk.intValue
+        } else if let risk = text(obj["risk"]).flatMap({ Int($0) }) {
+            report.riskScore = risk
+        }
+        let lowered = type?.lowercased() ?? ""
+        if lowered == "hosting" { report.isDatacenter = true }
+        if lowered == "vpn" { report.isVPN = true }
+        if lowered == "tor" { report.isTor = true }
+        if lowered == "wireless" { report.isMobile = true }
+        if bool(obj, "proxy"), lowered != "vpn", lowered != "tor" { report.isProxy = true }
+        return text(obj["timezone"])
+    }
+
+    private static func apply(ipApiCom obj: [String: Any], to report: inout IPPurityReport) -> String? {
+        report.sources.append("ip-api.com")
+        report.hasReputation = true
+        report.countryCode = report.countryCode ?? text(obj["countryCode"])?.uppercased()
+        report.country = report.country ?? text(obj["country"])
+        report.city = report.city ?? text(obj["city"])
+        report.org = report.org ?? text(obj["isp"]) ?? text(obj["org"])
+        if bool(obj, "hosting") { report.isDatacenter = true }
+        if bool(obj, "proxy") { report.isProxy = true }
+        if bool(obj, "mobile") { report.isMobile = true }
+        return text(obj["timezone"])
     }
 
     // MARK: - Scoring (community heuristics, not an official OpenAI standard)
@@ -254,6 +352,13 @@ enum IPPurityChecker {
         if report.isAbuser {
             let s = report.abuserScore.map { "（滥用分 \($0)）" } ?? ""
             risks.append(PurityRiskItem(title: "滥用记录", detail: "该 IP 段有滥用 / 攻击记录\(s)", penalty: 30))
+        }
+        if let risk = report.riskScore {
+            if risk >= 67 {
+                risks.append(PurityRiskItem(title: "高风险评分", detail: "proxycheck.io 风险分 \(risk)/100（近期有攻击 / 滥用行为）", penalty: 30))
+            } else if risk >= 34 {
+                risks.append(PurityRiskItem(title: "中等风险评分", detail: "proxycheck.io 风险分 \(risk)/100", penalty: 10))
+            }
         }
         if report.trace.warp == "on" || report.trace.warp == "plus" {
             risks.append(PurityRiskItem(title: "Cloudflare WARP", detail: "当前通过 WARP 访问，共享出口通常风险较高", penalty: 15))
