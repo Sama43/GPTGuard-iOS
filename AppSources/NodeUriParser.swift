@@ -61,6 +61,7 @@ enum NodeUriParser {
         case "ss": return try parseShadowsocks(trimmed)
         case "hysteria2", "hy2": return try parseHysteria2(trimmed)
         case "tuic": return try parseTuic(trimmed)
+        case "anytls": return try parseAnyTls(trimmed)
         case "socks", "socks5": return try parseSocks5(trimmed)
         case "http", "https": return try parseHttp(trimmed)
         default: throw err("不支持的协议: \(scheme)")
@@ -289,6 +290,36 @@ enum NodeUriParser {
         return ProxyNode(name: name, protocol: .tuic, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
     }
 
+    /// anytls://password@host:port/?sni=example.com&insecure=1&fp=chrome&alpn=h2,http/1.1#name
+    private static func parseAnyTls(_ raw: String) throws -> ProxyNode {
+        guard let comps = URLComponents(string: raw),
+              let password = comps.user?.removingPercentEncoding, !password.isEmpty,
+              let host = comps.host, !host.isEmpty else {
+            throw err("AnyTLS 链接缺少密码或服务器")
+        }
+        let port = comps.port ?? 443
+        let params = queryDict(comps)
+        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "AnyTLS-\(host):\(port)"
+        let reality = (params["security"] ?? "").lowercased() == "reality"
+
+        let outbound: [String: Any] = [
+            "type": "anytls",
+            "tag": "proxy",
+            "server": host,
+            "server_port": port,
+            "password": password,
+            "tls": buildTls(
+                serverName: params["sni"] ?? params["peer"] ?? host,
+                insecure: isTruthy(params["insecure"] ?? params["allowInsecure"]),
+                alpn: params["alpn"],
+                fp: params["fp"],
+                realityPub: reality ? params["pbk"] : nil,
+                realitySid: reality ? params["sid"] : nil
+            )
+        ]
+        return ProxyNode(name: name, protocol: .anytls, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
+    }
+
     private static func parseSocks5(_ raw: String) throws -> ProxyNode {
         guard let comps = URLComponents(string: raw), let host = comps.host, !host.isEmpty else {
             throw err("SOCKS5 缺少服务器")
@@ -363,6 +394,7 @@ enum NodeUriParser {
             case "shadowsocks": proto = .shadowsocks
             case "hysteria2": proto = .hysteria2
             case "tuic": proto = .tuic
+            case "anytls": proto = .anytls
             case "socks": proto = .socks5
             case "http": proto = .http
             default: proto = .rawSingBox

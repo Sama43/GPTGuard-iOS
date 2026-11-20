@@ -32,6 +32,11 @@ jobs:
             -o "$RUNNER_TEMP/subscription-node-merge-tests"
           "$RUNNER_TEMP/subscription-node-merge-tests"
 
+      - name: Test node URI parser
+        run: |
+          xcrun swiftc Shared/VpnModels.swift AppSources/NodeUriParser.swift Tests/NodeUriParserTests.swift -o "$RUNNER_TEMP/node-uri-parser-tests"
+          "$RUNNER_TEMP/node-uri-parser-tests"
+
       - name: Test sealed tunnel configuration
         run: |
           xcrun swiftc Shared/VpnModels.swift Shared/TunnelSingBoxConfigGenerator.swift Tests/TunnelConfigTests.swift -o "$RUNNER_TEMP/tunnel-config-tests"

@@ -182,6 +182,27 @@ enum ClashYamlParser {
                 realitySid: nil
             )
 
+        case "anytls":
+            guard let password = str(m, "password"), !password.isEmpty else {
+                throw NSError(domain: "ClashYaml", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少 password"])
+            }
+            proto = .anytls
+            outbound["type"] = "anytls"
+            outbound["password"] = password
+            if let v = intVal(m, "idle-session-check-interval"), v > 0 { outbound["idle_session_check_interval"] = "\(v)s" }
+            if let v = intVal(m, "idle-session-timeout"), v > 0 { outbound["idle_session_timeout"] = "\(v)s" }
+            if let v = intVal(m, "min-idle-session"), v >= 0 { outbound["min_idle_session"] = v }
+            let reality = m["reality-opts"] as? [String: Any]
+            outbound["tls"] = buildTls(
+                server: server,
+                sni: str(m, "sni") ?? str(m, "servername"),
+                insecure: boolVal(m, "skip-cert-verify"),
+                alpn: strList(m, "alpn"),
+                fp: str(m, "client-fingerprint"),
+                realityPub: reality.flatMap { str($0, "public-key") },
+                realitySid: reality.flatMap { str($0, "short-id") }
+            )
+
         case "socks5":
             proto = .socks5
             outbound["type"] = "socks"

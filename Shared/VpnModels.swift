@@ -39,6 +39,7 @@ enum ProxyProtocol: String, Codable, CaseIterable {
     case shadowsocks = "SS"
     case hysteria2 = "Hysteria2"
     case tuic = "TUIC"
+    case anytls = "AnyTLS"
     case socks5 = "SOCKS5"
     case http = "HTTP"
     case rawSingBox = "sing-box JSON"
