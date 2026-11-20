@@ -34,7 +34,7 @@ jobs:
 
       - name: Test node URI parser
         run: |
-          xcrun swiftc Shared/VpnModels.swift AppSources/NodeUriParser.swift Tests/NodeUriParserTests.swift -o "$RUNNER_TEMP/node-uri-parser-tests"
+          xcrun swiftc Shared/VpnModels.swift AppSources/NodeUriParser.swift Tests/ClashYamlParserStub.swift Tests/NodeUriParserTests.swift -o "$RUNNER_TEMP/node-uri-parser-tests"
           "$RUNNER_TEMP/node-uri-parser-tests"
 
       - name: Test sealed tunnel configuration
