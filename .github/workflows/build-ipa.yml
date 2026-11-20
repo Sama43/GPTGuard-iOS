@@ -1,0 +1,188 @@
+name: Build GPTGuard iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
+    paths-ignore: [ "**/*.md" ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout GPTGuard-iOS
+        uses: actions/checkout@v4
+
+      - name: Test subscription node refresh
+        run: |
+          xcrun swiftc \
+            Shared/VpnModels.swift \
+            AppSources/SubscriptionNodeMerge.swift \
+            Tests/SubscriptionNodeMergeTests.swift \
+            -o "$RUNNER_TEMP/subscription-node-merge-tests"
+          "$RUNNER_TEMP/subscription-node-merge-tests"
+
+      - name: Test sealed tunnel configuration
+        run: |
+          xcrun swiftc Shared/VpnModels.swift Shared/TunnelSingBoxConfigGenerator.swift Tests/TunnelConfigTests.swift -o "$RUNNER_TEMP/tunnel-config-tests"
+          mkdir -p "$RUNNER_TEMP/guard-configs"
+          "$RUNNER_TEMP/tunnel-config-tests" "$RUNNER_TEMP/guard-configs"
+
+      - name: Read Xcode cache key
+        id: xcode
+        shell: bash
+        run: |
+          printf 'version=%s\n' "$(xcodebuild -version | tr '\n' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Corebridge XCFramework
+        id: corebridge
+        uses: actions/cache@v4
+        with:
+          path: Frameworks/Corebridge.xcframework
+          key: corebridge-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('corebridge/**', '.github/workflows/build-ipa.yml') }}
+
+      - name: Setup Go
+        if: steps.corebridge.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Install SagerNet gomobile
+        if: steps.corebridge.outputs.cache-hit != 'true'
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build Corebridge.xcframework (sing-box v1.14.4 with gVisor TUN)
+        if: steps.corebridge.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          test "$(git -C /tmp/sing-box rev-parse HEAD)" = c005f35300ce76427dc285481ec5695f5b179cd2
+          mkdir -p /tmp/sing-box/corebridge
+          cp corebridge/*.go /tmp/sing-box/corebridge/
+          cd /tmp/sing-box
+          GUARD_TEST_CONFIGS="$RUNNER_TEMP/guard-configs" go test -tags with_gvisor ./corebridge
+          gomobile init
+          mkdir -p "${GITHUB_WORKSPACE}/Frameworks"
+          gomobile bind -v \
+            -target=ios \
+            -iosversion=17.0 \
+            -trimpath \
+            -buildvcs=false \
+            -tags "with_gvisor,with_quic,with_utls,with_low_memory,grpcnotrace,badlinkname,tfogo_checklinkname0" \
+            -o "${GITHUB_WORKSPACE}/Frameworks/Corebridge.xcframework" \
+            ./corebridge
+
+      - name: Generate AppIcon PNG (1024x1024)
+        run: |
+          python3 - << 'PY'
+          import zlib, struct, math
+
+          w = h = 1024
+          rows = []
+          for y in range(h):
+              row = bytearray([0])
+              for x in range(w):
+                  # Dark cool-slate background #101518
+                  r, g, b = 16, 21, 24
+                  nx = (x - 512) / 512.0
+                  ny = (y - 512) / 512.0
+                  # OpenAI-green shield (#10A37F)
+                  in_outer = abs(nx) < (0.54 - max(0.0, ny) * 0.48) and -0.60 < ny < 0.65
+                  in_inner = abs(nx) < (0.42 - max(0.0, ny) * 0.38) and -0.47 < ny < 0.50
+                  if in_outer and not in_inner:
+                      r, g, b = 16, 163, 127
+                  # Inner light core (#ECECF1)
+                  if abs(nx) < 0.24 and abs(ny - 0.04) < 0.16:
+                      r, g, b = 236, 236, 241
+                  # Center green dot (#22C55E)
+                  if math.hypot(nx, ny - 0.04) < 0.08:
+                      r, g, b = 34, 197, 94
+                  row.extend((r, g, b))
+              rows.append(bytes(row))
+
+          def chunk(tag, data):
+              return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+
+          ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+          idat = zlib.compress(b"".join(rows), 6)
+          png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+          out = "Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+          with open(out, "wb") as f:
+              f.write(png)
+          PY
+          cat > Resources/Assets.xcassets/AppIcon.appiconset/Contents.json << 'EOF'
+          {
+            "images" : [
+              {
+                "filename" : "AppIcon.png",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          EOF
+
+      - name: Generate Xcode Project via XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build Unsigned Release .app + PacketTunnel.appex for iOS arm64
+        run: |
+          mkdir -p build
+          set +e
+          xcodebuild build \
+            -project GPTGuard.xcodeproj \
+            -scheme GPTGuard \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" 2>&1 | tee build/xcodebuild.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "================ LINKER / COMPILER ERROR SUMMARY ================"
+            grep -n -C 3 -E "(ld:|error:|Undefined symbols|framework not found|library not found|duplicate symbol|not safe for use in application extensions)" build/xcodebuild.log | tail -n 100 || true
+            echo "================================================================="
+            exit "$STATUS"
+          fi
+
+      - name: Package .ipa
+        run: |
+          mkdir -p build/ipa/Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/GPTGuard.app build/ipa/Payload/
+          version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/ipa/Payload/GPTGuard.app/Info.plist)
+          echo "IPA_NAME=GPTGuard-iOS-v$version-unsigned.ipa" >> "$GITHUB_ENV"
+          cd build/ipa
+          zip -qry "${GITHUB_WORKSPACE}/GPTGuard-iOS-v$version-unsigned.ipa" Payload
+          ls -lh "${GITHUB_WORKSPACE}/GPTGuard-iOS-v$version-unsigned.ipa"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPTGuard-iOS-IPA
+          path: ${{ env.IPA_NAME }}
+
+      - name: Publish GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.IPA_NAME }}
