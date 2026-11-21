@@ -60,5 +60,32 @@ struct TunnelConfigTests {
         let probeRules = (probeRoot["route"] as! [String: Any])["rules"] as! [[String: Any]]
         precondition(probeRules.first?["action"] as? String == "resolve"
             && probeRules.first?["strategy"] as? String == "ipv4_only")
+
+        // Domain-passthrough nodes block DNS / IP literals: no resolve rules anywhere,
+        // but the phone-side IPv6 block stays in place.
+        var passthroughNode = node
+        passthroughNode.domainPassthrough = true
+        for global in [false, true] {
+            let tag = "proxy-pt-\(global)"
+            let config = try TunnelSingBoxConfigGenerator.generateTunnelConfig(node: passthroughNode, probePort: 30000,
+                settings: VpnGuardSettings(globalMode: global), cacheURL: cache, proxyTag: tag)
+            let root = try JSONSerialization.jsonObject(with: Data(config.utf8)) as! [String: Any]
+            let rules = (root["route"] as! [String: Any])["rules"] as! [[String: Any]]
+            precondition(!rules.contains { $0["action"] as? String == "resolve" }, "passthrough must not resolve locally")
+            precondition(rules.contains { $0["ip_version"] as? Int == 6 && $0["action"] as? String == "reject" })
+            precondition(rules.contains { $0["inbound"] as? [String] == ["mixed-in"] && $0["outbound"] as? String == tag })
+            let dnsRules = (root["dns"] as! [String: Any])["rules"] as! [[String: Any]]
+            precondition(dnsRules.first?["query_type"] as? [String] == ["AAAA"]
+                && dnsRules.first?["action"] as? String == "predefined")
+            let route = root["route"] as! [String: Any]
+            precondition(route["final"] as? String == (global ? "guard" : "direct"))
+            if !global {
+                precondition(rules.contains { $0["domain_suffix"] != nil && $0["outbound"] as? String == "guard" })
+            }
+        }
+        let passthroughProbe = try TunnelSingBoxConfigGenerator.generateStandaloneProbe(node: passthroughNode, corePort: 30002)
+        let passthroughProbeRoot = try JSONSerialization.jsonObject(with: Data(passthroughProbe.utf8)) as! [String: Any]
+        let passthroughProbeRules = (passthroughProbeRoot["route"] as! [String: Any])["rules"] as! [[String: Any]]
+        precondition(passthroughProbeRules.count == 1 && passthroughProbeRules[0]["outbound"] as? String == "proxy")
     }
 }

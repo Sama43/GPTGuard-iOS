@@ -64,5 +64,6 @@ enum SubscriptionNodeMerge {
         node.lastExitIp = previous.lastExitIp
         node.lastExitCountry = previous.lastExitCountry
         node.lastExitOrg = previous.lastExitOrg
+        node.domainPassthrough = previous.domainPassthrough
     }
 }

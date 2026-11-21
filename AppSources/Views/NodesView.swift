@@ -24,6 +24,7 @@ struct NodesView: View {
     @State private var subFilter: UUID? = nil
     @State private var banner: (Bool, String)? = nil
     @State private var testingIds: Set<UUID> = []
+    @State private var passthroughPrompt: PassthroughPrompt? = nil
     @State private var refreshingSubs: Set<UUID> = []
 
     private var filtered: [ProxyNode] {
@@ -145,6 +146,9 @@ struct NodesView: View {
                                 }
                                 Text("\(node.server):\(node.port)").font(.caption2).foregroundStyle(VpnTheme.textSecondary).lineLimit(1)
                                 if node.skipsTLSVerification { Text("此节点已关闭 TLS 证书验证").font(.caption2).foregroundStyle(VpnTheme.killRed) }
+                                if node.usesDomainPassthrough {
+                                    Text("域名直通：出口可能为 IPv6（长按卡片可关闭）").font(.caption2).foregroundStyle(VpnTheme.warnAmber)
+                                }
                                 if let cc = node.lastExitCountry {
                                     Text("出口: \(cc) · \(node.lastExitIp ?? "") · \(node.lastLatencyMs ?? 0)ms").font(.caption2).foregroundStyle(VpnTheme.shieldGreen)
                                 }
@@ -161,9 +165,15 @@ struct NodesView: View {
                                         testingIds.insert(node.id)
                                         Task {
                                             let res = await engine.testNodeIsolated(node)
-                                            banner = res.success
-                                                ? (true, "\(node.name): \(res.countryCode ?? "?") (\(res.exitIp ?? "-")) \(res.latencyMs ?? 0)ms")
-                                                : (false, "\(node.name) 测速失败: \(res.error ?? "")")
+                                            if res.needsDomainPassthrough {
+                                                banner = (false, "\(node.name) 强制 IPv4 失败（节点拦截了 DNS 查询），域名直通可用")
+                                                passthroughPrompt = PassthroughPrompt(nodeId: node.id, nodeName: node.name,
+                                                    exit: "\(res.countryCode ?? "?") (\(res.exitIp ?? "-")) \(res.latencyMs ?? 0)ms")
+                                            } else {
+                                                banner = res.success
+                                                    ? (true, "\(node.name): \(res.countryCode ?? "?") (\(res.exitIp ?? "-")) \(res.latencyMs ?? 0)ms")
+                                                    : (false, "\(node.name) 测速失败: \(res.error ?? "")")
+                                            }
                                             testingIds.remove(node.id)
                                         }
                                     } label: {
@@ -181,12 +191,29 @@ struct NodesView: View {
                             .padding(12).background(VpnTheme.surfaceDark)
                             .overlay(RoundedRectangle(cornerRadius: 12).stroke(VpnTheme.borderDark, lineWidth: 1))
                             .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .contextMenu {
+                                Button {
+                                    engine.setDomainPassthrough(node.id, enabled: !node.usesDomainPassthrough)
+                                } label: {
+                                    Label(node.usesDomainPassthrough ? "关闭域名直通（恢复强制 IPv4）" : "开启域名直通（允许 IPv6 出口）",
+                                          systemImage: "arrow.triangle.branch")
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal).padding(.bottom, 16)
                 }
             }
             .background(VpnTheme.bgDark.ignoresSafeArea())
+            .alert("该节点拦截了 DNS 查询", isPresented: Binding(
+                get: { passthroughPrompt != nil },
+                set: { if !$0 { passthroughPrompt = nil } }
+            ), presenting: passthroughPrompt) { prompt in
+                Button("开启域名直通") { engine.setDomainPassthrough(prompt.nodeId, enabled: true) }
+                Button("暂不开启", role: .cancel) {}
+            } message: { prompt in
+                Text("「\(prompt.nodeName)」无法强制 IPv4 出口，但改用域名直通测速成功：\(prompt.exit)。\n开启后由节点决定走 IPv4 还是 IPv6，锁定 IP 时会同时记录这个节点的两种出口，不会因切换而误熔断。")
+            }
             .navigationTitle("节点与机场订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -283,4 +310,10 @@ private struct VpnImportSheet: View {
             .onAppear { tab = initialTab; subUrl = prefillUrl }
         }
     }
+}
+
+private struct PassthroughPrompt {
+    let nodeId: UUID
+    let nodeName: String
+    let exit: String
 }

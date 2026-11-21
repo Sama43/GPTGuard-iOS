@@ -13,6 +13,8 @@ import Foundation
 /// - Any IPv6 packet entering the TUN is rejected (never leaks around the tunnel).
 /// - Proxied traffic is resolved to IPv4 *before* being handed to the node, so the remote
 ///   server dials an IPv4 literal instead of picking IPv4 or IPv6 on its own.
+///   Exception: domain-passthrough nodes (which block DNS / IP literals) get domains; the node then
+///   chooses the family, and exit pinning accepts that node's IPv4 and IPv6 exits.
 enum TunnelSingBoxConfigGenerator {
 
     static let openAIDomainSuffixes: [String] = [
@@ -70,6 +72,13 @@ enum TunnelSingBoxConfigGenerator {
             proxyOutbound["domain_resolver"] = ["server": "dns_bootstrap", "strategy": "ipv4_only"]
         }
 
+        var probeRules: [[String: Any]] = []
+        if !node.usesDomainPassthrough {
+            // Resolve to IPv4 through the node so its exit is always the IPv4 address.
+            probeRules.append(["inbound": ["mixed-in"], "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
+        }
+        probeRules.append(["inbound": ["mixed-in"], "outbound": "proxy"])
+
         let root: [String: Any] = [
             "log": ["level": "warn", "timestamp": false],
             "dns": [
@@ -85,11 +94,7 @@ enum TunnelSingBoxConfigGenerator {
             ],
             "outbounds": [proxyOutbound],
             "route": [
-                "rules": [
-                    // Resolve to IPv4 through the node so its exit is always the IPv4 address.
-                    ["inbound": ["mixed-in"], "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"],
-                    ["inbound": ["mixed-in"], "outbound": "proxy"]
-                ],
+                "rules": probeRules,
                 "final": "proxy",
                 "default_domain_resolver": "dns_bootstrap"
             ]
@@ -167,27 +172,34 @@ enum TunnelSingBoxConfigGenerator {
             ])
         }
 
+        let forceIPv4 = !node.usesDomainPassthrough
         var routeRules: [[String: Any]] = [
             ["action": "sniff"],
             ["protocol": "dns", "action": "hijack-dns"],
             // IPv6 disabled: reject every IPv6 packet entering the TUN (captured so it can't bypass the tunnel).
-            ["inbound": ["tun-in"], "ip_version": 6, "action": "reject"],
-            // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog.
-            // Resolve to IPv4 first so the watchdog sees the same IPv4 exit that ChatGPT traffic uses.
-            ["inbound": ["mixed-in"], "action": "resolve", "server": "dns_probe", "strategy": "ipv4_only"],
-            ["inbound": ["mixed-in"], "outbound": proxyTag]
+            ["inbound": ["tun-in"], "ip_version": 6, "action": "reject"]
         ]
+        if forceIPv4 {
+            // Resolve to IPv4 first so the watchdog sees the same IPv4 exit that ChatGPT traffic uses.
+            routeRules.append(["inbound": ["mixed-in"], "action": "resolve", "server": "dns_probe", "strategy": "ipv4_only"])
+        }
+        // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog.
+        routeRules.append(["inbound": ["mixed-in"], "outbound": proxyTag])
 
         let routeFinal: String
         if settings.globalMode {
             // Reject UDP 443 QUIC globally so TLS falls back cleanly to TCP
             routeRules.append(["network": "udp", "port": [443], "action": "reject"])
-            // Hand the node an IPv4 literal so a dual-stack node can never egress over IPv6.
-            routeRules.append(["action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
+            if forceIPv4 {
+                // Hand the node an IPv4 literal so a dual-stack node can never egress over IPv6.
+                routeRules.append(["action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
+            }
             routeFinal = "guard"
         } else {
             routeRules.append(["network": "udp", "port": [443], "domain_suffix": targetDomains, "action": "reject"])
-            routeRules.append(["domain_suffix": targetDomains, "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
+            if forceIPv4 {
+                routeRules.append(["domain_suffix": targetDomains, "action": "resolve", "server": "dns_remote", "strategy": "ipv4_only"])
+            }
             routeRules.append(["domain_suffix": targetDomains, "outbound": "guard"])
             routeRules.append(["ip_cidr": ["198.18.0.0/15"], "outbound": "guard"])
             routeFinal = "direct"

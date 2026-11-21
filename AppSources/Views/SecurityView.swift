@@ -27,7 +27,7 @@ struct SecurityView: View {
                     }
 
                     if engine.settings.lockExitIp, let pinned = engine.settings.pinnedExitIp {
-                        Button("解除全局锁 IP (\(pinned))") { engine.clearGlobalExitIp() }
+                        Button("解除全局锁 IP (\(pinned)\(engine.settings.pinnedExitIpAlt.map { " / \($0)" } ?? ""))") { engine.clearGlobalExitIp() }
                             .foregroundStyle(VpnTheme.warnAmber)
                     } else {
                         Button("锁定当前出口 IP（漂移瞬间黑洞熔断）") { engine.pinGlobalExitIp() }

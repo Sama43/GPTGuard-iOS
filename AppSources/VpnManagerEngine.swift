@@ -547,6 +547,7 @@ final class VpnManagerEngine: ObservableObject {
         sessions[idx].boundNodeId = newNodeId
         sessions[idx].lockExitIp = false
         sessions[idx].pinnedExitIp = nil
+        sessions[idx].pinnedExitIpAlt = nil
         storage.saveSessions(sessions)
         if activeSessionId == sessionId && vpnStatus == .connected {
             pushCurrentPayloadToRunningTunnel()
@@ -557,6 +558,7 @@ final class VpnManagerEngine: ObservableObject {
         guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
         sessions[idx].lockExitIp = true
         sessions[idx].pinnedExitIp = ip
+        sessions[idx].pinnedExitIpAlt = pinnedAltExit(for: ip)
         storage.saveSessions(sessions)
         if activeSessionId == sessionId && vpnStatus == .connected {
             pushCurrentPayloadToRunningTunnel()
@@ -567,6 +569,7 @@ final class VpnManagerEngine: ObservableObject {
         guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
         sessions[idx].lockExitIp = false
         sessions[idx].pinnedExitIp = nil
+        sessions[idx].pinnedExitIpAlt = nil
         storage.saveSessions(sessions)
         if activeSessionId == sessionId && vpnStatus == .connected {
             pushCurrentPayloadToRunningTunnel()
@@ -673,6 +676,31 @@ final class VpnManagerEngine: ObservableObject {
         guard runningNodeTests < 3 else { return ExitCheckResult(success: false, error: "已有 3 个测速任务，请稍后再试") }
         runningNodeTests += 1
         defer { runningNodeTests -= 1 }
+        let check = await probeIsolated(node)
+        if !check.success, !node.usesDomainPassthrough {
+            // Some nodes (e.g. residential relays) block DNS / IP-literal destinations, so forced IPv4
+            // can't work. If the same node works with domains, offer domain passthrough instead.
+            var passthrough = node
+            passthrough.domainPassthrough = true
+            var fallback = await probeIsolated(passthrough)
+            if fallback.success {
+                fallback.needsDomainPassthrough = true
+                return fallback
+            }
+        }
+        if check.success, let idx = nodes.firstIndex(where: { $0.id == node.id }) {
+            var measured = nodes
+            measured[idx].lastLatencyMs = check.latencyMs
+            measured[idx].lastExitIp = check.exitIp
+            measured[idx].lastExitCountry = check.countryCode
+            measured[idx].lastExitOrg = check.org ?? measured[idx].lastExitOrg
+            do { try commitCatalog(nodes: measured, subscriptions: subscriptions) }
+            catch { recordLocalEvent(.warn, tag: "STORAGE", error.localizedDescription) }
+        }
+        return check
+    }
+
+    private func probeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
         guard let port = try? LoopbackPort.allocate() else { return ExitCheckResult(success: false, error: "无法分配本地测速端口") }
         guard let cfg = try? TunnelSingBoxConfigGenerator.generateStandaloneProbe(node: node, corePort: port) else {
             return ExitCheckResult(success: false, error: "节点配置生成失败")
@@ -688,16 +716,30 @@ final class VpnManagerEngine: ObservableObject {
         try? await Task.sleep(nanoseconds: 250_000_000)
         let check = await ExitIpVerifier.verify(corePort: port, enrichGeo: true, timeoutSec: 8)
         await Task.detached { CorebridgeStopTempCore(handle) }.value
-        if check.success, let idx = nodes.firstIndex(where: { $0.id == node.id }) {
-            var measured = nodes
-            measured[idx].lastLatencyMs = check.latencyMs
-            measured[idx].lastExitIp = check.exitIp
-            measured[idx].lastExitCountry = check.countryCode
-            measured[idx].lastExitOrg = check.org ?? measured[idx].lastExitOrg
-            do { try commitCatalog(nodes: measured, subscriptions: subscriptions) }
-            catch { recordLocalEvent(.warn, tag: "STORAGE", error.localizedDescription) }
-        }
         return check
+    }
+
+    func setDomainPassthrough(_ nodeId: UUID, enabled: Bool) {
+        guard let idx = nodes.firstIndex(where: { $0.id == nodeId }) else { return }
+        var next = nodes
+        next[idx].domainPassthrough = enabled ? true : nil
+        // The previous measurement was taken in the other mode.
+        next[idx].lastLatencyMs = nil
+        next[idx].lastExitIp = nil
+        next[idx].lastExitCountry = nil
+        do { try commitCatalog(nodes: next, subscriptions: subscriptions) }
+        catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription); return }
+        recordLocalEvent(.info, tag: "NODE", enabled
+            ? "节点「\(next[idx].name)」已开启域名直通：出口可能为 IPv6，锁定 IP 时会同时记录 IPv4 与 IPv6"
+            : "节点「\(next[idx].name)」已关闭域名直通：恢复强制 IPv4 出口")
+        if activeSession?.boundNodeId == nodeId { pushCurrentPayloadToRunningTunnel() }
+    }
+
+    /// For a domain-passthrough node, the node's exit of the other IP family (learned by the tunnel).
+    private func pinnedAltExit(for ip: String) -> String? {
+        let family = [snapshot.exitIpV4, snapshot.exitIpV6].compactMap { $0 }
+        guard family.contains(ip) else { return nil }
+        return family.first { $0 != ip }
     }
 
     func updateSettings(_ mutate: (inout VpnGuardSettings) -> Void) {
@@ -712,11 +754,12 @@ final class VpnManagerEngine: ObservableObject {
 
     func pinGlobalExitIp() {
         guard let ip = snapshot.exitIp else { return }
-        updateSettings { $0.lockExitIp = true; $0.pinnedExitIp = ip }
+        let alt = pinnedAltExit(for: ip)
+        updateSettings { $0.lockExitIp = true; $0.pinnedExitIp = ip; $0.pinnedExitIpAlt = alt }
     }
 
     func clearGlobalExitIp() {
-        updateSettings { $0.lockExitIp = false; $0.pinnedExitIp = nil }
+        updateSettings { $0.lockExitIp = false; $0.pinnedExitIp = nil; $0.pinnedExitIpAlt = nil }
     }
 
     func recordLocalEvent(_ level: EventLevel, tag: String, _ message: String) {

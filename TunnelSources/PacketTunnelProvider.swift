@@ -45,6 +45,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var directProbeTask: Task<Void, Never>?
     private var directProbeTicket: UInt64 = 0
     private var directCheckedAt: Date = .distantPast
+    /// Domain-passthrough nodes: this node's current IPv4 / IPv6 exits, and the exit they were learned for.
+    private var familyExits: Set<String> = []
+    private var familyProbedFor: String?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         queue.async {
@@ -66,6 +69,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.snapshotRevision = 0
             self.directIps = []
             self.directCheckedAt = .distantPast
+            self.resetFamilyExits()
             guard let node = self.currentNode else {
                 completionHandler(self.failure("未找到已绑定节点，请返回 App 重新选择"))
                 return
@@ -210,7 +214,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         invalidateChecks()
         guard seal() else { return }
         let rebuild = currentNode?.singBoxOutboundJson != node.singBoxOutboundJson
+            || currentNode?.usesDomainPassthrough != node.usesDomainPassthrough
             || settings.globalMode != newSettings.globalMode || settings.includeAuthHelperDomains != newSettings.includeAuthHelperDomains
+        if currentNode?.id != node.id || rebuild { resetFamilyExits() }
         let leakToggled = settings.detectDirectLeak != newSettings.detectDirectLeak
         settings = newSettings
         if leakToggled { directIps = []; snapshot.directIp = nil; directCheckedAt = .distantPast }
@@ -270,6 +276,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             catch { lockTraffic(error.localizedDescription, manual: true); return }
         }
         retryIndex = 0
+        resetFamilyExits()
         snapshot.status = .verifyingExit
         snapshot.killSwitchReason = nil
         recordEvent(.info, tag: "VERIFY", "正在通过已绑定节点校验出口")
@@ -314,17 +321,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         scheduleCheck(after: 10)
     }
 
+    private func resetFamilyExits() {
+        familyExits = []
+        familyProbedFor = nil
+        snapshot.exitIpV4 = nil
+        snapshot.exitIpV6 = nil
+    }
+
     private func scheduleCheck(after delay: Int) {
         let ticket = generation
         let port = probePort
+        let passthrough = currentNode?.usesDomainPassthrough == true
+        let probedFor = familyProbedFor
         checkTask = Task {
             do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
             catch { return }
-            let result = await ExitIpVerifier.verify(corePort: port, enrichGeo: false, timeoutSec: 4)
+            var result = await ExitIpVerifier.verify(corePort: port, enrichGeo: false, timeoutSec: 4)
+            // A passthrough node may egress over either family. Learn both exits whenever the exit
+            // changes, so the pin check can tell a family switch apart from a different node.
+            if passthrough, result.success, let ip = result.exitIp, ip != probedFor, !Task.isCancelled {
+                result.familyExits = await ExitIpVerifier.familyExits(corePort: port)
+            }
             guard !Task.isCancelled else { return }
+            let checked = result
             self.queue.async {
                 guard ticket == self.generation, !self.offline, !self.manuallyLocked else { return }
-                self.applyCheck(result)
+                self.applyCheck(checked)
             }
         }
     }
@@ -346,6 +368,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         snapshot.exitCountry = country
         snapshot.latencyMs = result.latencyMs
         if ipChanged { snapshot.exitCity = nil; snapshot.exitOrg = nil }
+        if let learned = result.familyExits {
+            familyExits = learned
+            familyProbedFor = ip
+            snapshot.exitIpV4 = learned.first { !$0.contains(":") }
+            snapshot.exitIpV6 = learned.first { $0.contains(":") }
+        }
         if let violation = evaluatePolicyViolation(exitIp: ip, countryCode: country) {
             lockTraffic(violation, manual: true)
             return
@@ -451,13 +479,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if !settings.allowedCountries.isEmpty && !settings.allowedCountries.contains(cc) {
             return "地区白名单黑洞熔断！出口 [\(cc)] 不在允许列表内"
         }
-        if settings.lockExitIp, let pinned = settings.pinnedExitIp, !pinned.isEmpty, exitIp != pinned {
+        if settings.lockExitIp, let pinned = settings.pinnedExitIp, !pinned.isEmpty,
+           !exitMatchesPin(exitIp, pinned: pinned, alt: settings.pinnedExitIpAlt) {
             return "全局锁 IP 漂移熔断！锁定 \(pinned) 已变为 \(exitIp) (\(cc))"
         }
-        if let sess = currentSession, sess.lockExitIp, let pinned = sess.pinnedExitIp, !pinned.isEmpty, exitIp != pinned {
+        if let sess = currentSession, sess.lockExitIp, let pinned = sess.pinnedExitIp, !pinned.isEmpty,
+           !exitMatchesPin(exitIp, pinned: pinned, alt: sess.pinnedExitIpAlt) {
             return "身份「\(sess.name)」IP 漂移熔断！锁定 \(pinned) 已变为 \(exitIp) (\(cc))"
         }
         return nil
+    }
+
+    /// Forced-IPv4 nodes must match the pin exactly. A domain-passthrough node may also switch
+    /// between its IPv4 and IPv6 exits: accepted only while the pinned address is still one of
+    /// this node's current family exits (learned through the node at the same moment).
+    private func exitMatchesPin(_ exitIp: String, pinned: String, alt: String?) -> Bool {
+        let exit = ExitIpVerifier.canonicalIp(exitIp)
+        let accepted = Set([pinned, alt].compactMap { $0 }.filter { !$0.isEmpty }.map(ExitIpVerifier.canonicalIp))
+        if accepted.contains(exit) { return true }
+        guard currentNode?.usesDomainPassthrough == true else { return false }
+        return familyExits.contains(exit) && !familyExits.isDisjoint(with: accepted)
     }
 
     private func buildTunnelNetworkSettings() -> NEPacketTunnelNetworkSettings {

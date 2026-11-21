@@ -14,6 +14,7 @@ struct SubscriptionNodeMergeTests {
         primary.lastExitIp = "192.0.2.1"
         primary.lastExitCountry = "US"
         primary.lastExitOrg = "Example"
+        primary.domainPassthrough = true
         let secondary = node("Secondary", outbound: outbound)
         let removed = node("Removed", outbound: #"{"type":"socks","server":"removed.example.com"}"#)
         let renamed = node("Renamed", outbound: reordered)
@@ -28,6 +29,8 @@ struct SubscriptionNodeMergeTests {
         precondition(updated[1].lastExitIp == primary.lastExitIp, "Keep previous IP")
         precondition(updated[1].lastExitCountry == primary.lastExitCountry, "Keep previous country")
         precondition(updated[1].lastExitOrg == primary.lastExitOrg, "Keep previous network")
+        precondition(updated[1].usesDomainPassthrough, "Keep the domain-passthrough choice across refreshes")
+        precondition(!updated[0].usesDomainPassthrough, "Domain passthrough stays off by default")
 
         let changed = node("Primary", outbound: rotated)
         let replacements = SubscriptionNodeMerge.merge([changed], with: [primary], subscriptionId: subscriptionId)
@@ -41,6 +44,15 @@ struct SubscriptionNodeMergeTests {
         let duplicateInput = [node("Primary", outbound: reordered), node("Primary", outbound: reordered)]
         let duplicates = SubscriptionNodeMerge.merge(duplicateInput, with: [primary, duplicate], subscriptionId: subscriptionId)
         precondition(duplicates.map(\.id) == [primary.id, duplicate.id], "Duplicate entries need distinct, stable IDs")
+
+        let legacyNode = #"{"id":"6B1F2C3D-0000-4000-8000-000000000001","name":"Old","protocol":"VLESS","server":"h","port":443,"rawUri":"","singBoxOutboundJson":"{}","createdAt":0}"#
+        let decodedNode = try! JSONDecoder().decode(ProxyNode.self, from: Data(legacyNode.utf8))
+        precondition(!decodedNode.usesDomainPassthrough, "Catalogs saved before 1.0.6 still decode")
+        let legacySettings = try! JSONEncoder().encode(VpnGuardSettings())
+        var settingsObject = try! JSONSerialization.jsonObject(with: legacySettings) as! [String: Any]
+        settingsObject.removeValue(forKey: "pinnedExitIpAlt")
+        let settingsData = try! JSONSerialization.data(withJSONObject: settingsObject)
+        precondition((try? JSONDecoder().decode(VpnGuardSettings.self, from: settingsData)) != nil, "Settings saved before 1.0.6 still decode")
 
         print("Subscription node merge regression tests passed")
     }

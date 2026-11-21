@@ -120,7 +120,7 @@ struct SessionsView: View {
                 Text(bound.map { "绑定节点: [\($0.protocol.label)] \($0.name)" } ?? "绑定节点已删除")
                     .font(.caption).foregroundStyle(bound != nil ? VpnTheme.textPrimary : VpnTheme.killRed).lineLimit(1)
                 if sess.lockExitIp, let ip = sess.pinnedExitIp {
-                    Text("🔒 锁定出口 IP: \(ip)").font(.caption2).foregroundStyle(VpnTheme.shieldGreen)
+                    Text("🔒 锁定出口 IP: \(ip)\(sess.pinnedExitIpAlt.map { " / \($0)" } ?? "")").font(.caption2).foregroundStyle(VpnTheme.shieldGreen)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

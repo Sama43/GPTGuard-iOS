@@ -109,7 +109,7 @@ enum ExitIpVerifier {
 
         return ExitCheckResult(
             success: true,
-            exitIp: ip,
+            exitIp: canonicalIp(ip),
             countryCode: cc,
             latencyMs: latencyMs
         )
@@ -140,7 +140,7 @@ enum ExitIpVerifier {
                           let text = String(data: data, encoding: .utf8) else { return nil }
                     for line in text.components(separatedBy: .newlines) where line.hasPrefix("ip=") {
                         let ip = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-                        if IPv4Address(ip) != nil || IPv6Address(ip) != nil { return ip }
+                        if IPv4Address(ip) != nil || IPv6Address(ip) != nil { return canonicalIp(ip) }
                     }
                     return nil
                 }
@@ -153,6 +153,50 @@ enum ExitIpVerifier {
         }
     }
 
+    /// Learns a domain-passthrough node's exit per IP family. Uses domains that resolve to only an
+    /// A (or only an AAAA) record, so the node itself picks the family without any IP literal.
+    static func familyExits(corePort: Int, timeoutSec: TimeInterval = 3) async -> Set<String> {
+        let session = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: timeoutSec)
+        defer { session.invalidateAndCancel() }
+        let families: [(endpoints: [String], ipv6: Bool)] = [
+            (["https://api-ipv4.ip.sb/ip", "https://ipv4.icanhazip.com/"], false),
+            (["https://api-ipv6.ip.sb/ip", "https://ipv6.icanhazip.com/"], true)
+        ]
+        return await withTaskGroup(of: String?.self) { group in
+            for family in families {
+                group.addTask {
+                    for endpoint in family.endpoints {
+                        guard !Task.isCancelled, let url = URL(string: endpoint) else { return nil }
+                        var req = URLRequest(url: url, timeoutInterval: timeoutSec)
+                        req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                        guard let (data, response) = try? await session.data(for: req),
+                              (response as? HTTPURLResponse)?.statusCode == 200,
+                              let ip = String(data: data, encoding: .utf8)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
+                        if family.ipv6 ? IPv6Address(ip) != nil : IPv4Address(ip) != nil { return canonicalIp(ip) }
+                    }
+                    return nil
+                }
+            }
+            var found = Set<String>()
+            for await ip in group {
+                if let ip { found.insert(ip) }
+            }
+            return found
+        }
+    }
+
+    /// RFC 5952 form for IPv6 so addresses from different services compare equal.
+    static func canonicalIp(_ raw: String) -> String {
+        let ip = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ip.contains(":") else { return ip }
+        var addr = in6_addr()
+        guard inet_pton(AF_INET6, ip, &addr) == 1 else { return ip.lowercased() }
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        guard inet_ntop(AF_INET6, &addr, &buffer, socklen_t(buffer.count)) != nil else { return ip.lowercased() }
+        return String(cString: buffer)
+    }
+
     static func geo(corePort: Int, expectedIP: String) async -> (city: String?, org: String?)? {
         guard let url = URL(string: "https://ipwho.is/") else { return nil }
         let session = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: 4)
@@ -160,7 +204,7 @@ enum ExitIpVerifier {
         guard let (data, response) = try? await session.data(from: url),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              obj["ip"] as? String == expectedIP else { return nil }
+              (obj["ip"] as? String).map(canonicalIp) == canonicalIp(expectedIP) else { return nil }
         let connection = obj["connection"] as? [String: Any]
         return (obj["city"] as? String, (connection?["isp"] as? String) ?? (connection?["org"] as? String))
     }

@@ -66,6 +66,12 @@ struct ProxyNode: Identifiable, Codable, Equatable {
     var lastExitCountry: String? = nil
     var lastExitOrg: String? = nil
     var createdAt: Date = Date()
+    /// true: hand the node domain names instead of locally resolved IPv4 addresses. For nodes that
+    /// block DNS / IP-literal destinations; the node then picks IPv4 or IPv6 itself.
+    /// Optional so catalogs saved by older versions still decode.
+    var domainPassthrough: Bool? = nil
+
+    var usesDomainPassthrough: Bool { domainPassthrough == true }
 }
 
 struct SubscriptionProfile: Identifiable, Codable, Equatable {
@@ -88,6 +94,8 @@ struct AppIdentitySession: Identifiable, Codable, Equatable {
     var boundNodeId: UUID
     var lockExitIp: Bool = false
     var pinnedExitIp: String? = nil
+    /// The same node's exit of the other IP family (domain-passthrough nodes only).
+    var pinnedExitIpAlt: String? = nil
     var createdAt: Date = Date()
     var lastUsedAt: Date? = nil
 }
@@ -105,6 +113,8 @@ struct VpnGuardSettings: Codable, Equatable {
     var allowedCountries: Set<String> = []
     var lockExitIp: Bool = false
     var pinnedExitIp: String? = nil
+    /// The same node's exit of the other IP family (domain-passthrough nodes only).
+    var pinnedExitIpAlt: String? = nil
     var watchdogIntervalSec: Int = 5
     var killOnNetworkChange: Bool = true
     /// 出口 IP 与本机直连 IP 相同（节点实际未生效 / 直连泄露）时立即黑洞掐断 ChatGPT
@@ -144,6 +154,10 @@ struct ExitCheckResult {
     var city: String? = nil
     var latencyMs: Int? = nil
     var error: String? = nil
+    /// Domain-passthrough nodes: the node's IPv4 / IPv6 exits, learned via family-specific domains.
+    var familyExits: Set<String>? = nil
+    /// Speed test: forced IPv4 failed but the same node works in domain-passthrough mode.
+    var needsDomainPassthrough: Bool = false
 }
 
 struct ParseBatchResult {
@@ -162,6 +176,9 @@ struct TunnelSnapshot: Codable {
     var exitCountry: String? = nil
     var exitCity: String? = nil
     var exitOrg: String? = nil
+    /// Domain-passthrough nodes only: the node's exit per IP family (used to pin both).
+    var exitIpV4: String? = nil
+    var exitIpV6: String? = nil
     var latencyMs: Int? = nil
     var killSwitchReason: String? = nil
     /// 扩展进程绕过隧道探测到的本机直连出口 IP（用于直连泄露比对）
